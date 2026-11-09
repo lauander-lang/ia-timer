@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quiz timer</title>
+<style>
+  :root {
+    --ink: #1d2b2f;
+    --muted: #5b6b70;
+    --track: #dfe7e8;
+    --ok: #1f7a6d;
+    --warn: #b36a00;
+    --alert: #b3261e;
+    --bg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #eef3f3;
+      --muted: #a8b6b9;
+      --track: #34444a;
+      --ok: #5cc7b6;
+      --warn: #f0b252;
+      --alert: #ff8a80;
+      --bg: #172226;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 16px;
+  }
+  .timer { width: 100%; max-width: 420px; text-align: center; }
+  .label { font-size: 0.95rem; color: var(--muted); margin: 0 0 2px; }
+  .time {
+    font-size: clamp(2.4rem, 14vw, 3.6rem);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    line-height: 1.1;
+    margin: 0;
+    color: var(--ok);
+  }
+  .timer[data-state="warn"] .time { color: var(--warn); }
+  .timer[data-state="alert"] .time { color: var(--alert); }
+  .timer[data-state="done"] .time { color: var(--alert); }
+  .bar {
+    height: 8px;
+    background: var(--track);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0 10px;
+  }
+  .fill {
+    height: 100%;
+    width: 100%;
+    background: var(--ok);
+    transform-origin: left center;
+    transition: transform 0.4s linear, background-color 0.3s;
+  }
+  .timer[data-state="warn"] .fill { background: var(--warn); }
+  .timer[data-state="alert"] .fill,
+  .timer[data-state="done"] .fill { background: var(--alert); }
+  button {
+    font: inherit;
+    font-weight: 600;
+    color: #fff;
+    background: var(--ok);
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 20px;
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--muted); border: 1px solid var(--track); font-weight: 500; }
+  button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  .actions { display: flex; gap: 8px; justify-content: center; min-height: 38px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  @media (prefers-reduced-motion: reduce) { .fill { transition: none; } }
+</style>
+</head>
+<body>
+  <main class="timer" id="timer" data-state="idle">
+    <p class="label" id="label">Time remaining</p>
+    <p class="time" id="time" role="timer" aria-label="Time remaining">--:--</p>
+    <div class="bar" aria-hidden="true"><div class="fill" id="fill"></div></div>
+    <div class="actions">
+      <button type="button" id="start">Start timer</button>
+      <button type="button" id="reset" class="secondary" hidden>Reset (teacher)</button>
+    </div>
+    <p class="sr" id="live" aria-live="polite"></p>
+  </main>
+
+<script>
+(function () {
+  // Settings come from the page address, so one file can serve every quiz:
+  //   ?minutes=30&label=Quiz%201&warn=5&autostart=1&key=quiz1&admin=1
+  var params = new URLSearchParams(location.search);
+  var minutes = Math.max(0.1, parseFloat(params.get("minutes")) || 30);
+  var label = params.get("label") || "Time remaining";
+  var warnMin = parseFloat(params.get("warn"));
+  if (isNaN(warnMin)) warnMin = 5;
+  var autostart = params.get("autostart") === "1";
+  var admin = params.get("admin") === "1";
+  var storeKey = "iaQuizTimer:" + (params.get("key") || (minutes + "|" + label));
+  var totalMs = minutes * 60 * 1000;
+
+  var el = {
+    timer: document.getElementById("timer"),
+    label: document.getElementById("label"),
+    time: document.getElementById("time"),
+    fill: document.getElementById("fill"),
+    start: document.getElementById("start"),
+    reset: document.getElementById("reset"),
+    live: document.getElementById("live")
+  };
+  el.label.textContent = label;
+  if (admin) el.reset.hidden = false;
+
+  // Keep the end time in browser storage so a page refresh does not restart the clock.
+  // If storage is blocked (some browsers do this inside iframes), fall back to memory.
+  var memory = null;
+  function readEnd() {
+    try { var v = localStorage.getItem(storeKey); return v ? parseInt(v, 10) : null; }
+    catch (e) { return memory; }
+  }
+  function writeEnd(v) {
+    memory = v;
+    try {
+      if (v === null) localStorage.removeItem(storeKey);
+      else localStorage.setItem(storeKey, String(v));
+    } catch (e) { /* memory fallback already set */ }
+  }
+
+  var endTime = readEnd();
+  var tick = null;
+  var announced = {};
+
+  function fmt(ms) {
+    var s = Math.max(0, Math.ceil(ms / 1000));
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    var mm = (h > 0 && m < 10 ? "0" : "") + m;
+    var ss = (sec < 10 ? "0" : "") + sec;
+    return (h > 0 ? h + ":" : "") + mm + ":" + ss;
+  }
+
+  function announce(key, text) {
+    if (announced[key]) return;
+    announced[key] = true;
+    el.live.textContent = text;
+  }
+
+  function render() {
+    if (!endTime) {
+      el.timer.dataset.state = "idle";
+      el.time.textContent = fmt(totalMs);
+      el.fill.style.transform = "scaleX(1)";
+      return;
+    }
+    var left = endTime - Date.now();
+    el.time.textContent = fmt(left);
+    el.fill.style.transform = "scaleX(" + Math.max(0, Math.min(1, left / totalMs)) + ")";
+    if (left <= 0) {
+      el.timer.dataset.state = "done";
+      el.time.textContent = "Time is up";
+      el.start.hidden = true;
+      announce("done", "Time is up.");
+      clearInterval(tick);
+      tick = null;
+    } else if (left <= 60000 && totalMs > 60000) {
+      el.timer.dataset.state = "alert";
+      announce("one", "One minute remaining.");
+    } else if (left <= warnMin * 60000 && warnMin > 0 && totalMs > warnMin * 60000) {
+      el.timer.dataset.state = "warn";
+      announce("warn", Math.round(warnMin) + " minutes remaining.");
+    } else {
+      el.timer.dataset.state = "ok";
+    }
+  }
+
+  function run() {
+    el.start.hidden = true;
+    render();
+    if (!tick) tick = setInterval(render, 250);
+  }
+
+  function start() {
+    if (!endTime) {
+      endTime = Date.now() + totalMs;
+      writeEnd(endTime);
+    }
+    run();
+  }
+
+  function reset() {
+    clearInterval(tick);
+    tick = null;
+    endTime = null;
+    announced = {};
+    writeEnd(null);
+    el.start.hidden = false;
+    render();
+  }
+
+  el.start.addEventListener("click", start);
+  el.reset.addEventListener("click", reset);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) render(); });
+
+  if (endTime) run();          // resume after a refresh
+  else if (autostart) start(); // begin as soon as the page loads
+  else render();
+})();
+</script>
+</body>
+</html>
